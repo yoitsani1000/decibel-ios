@@ -152,8 +152,6 @@ const AUDIO_EXTENSIONS: ReadonlySet<string> = new Set([
 ]);
 const IMAGE_EXTENSIONS: ReadonlySet<string> = new Set(['jpg', 'jpeg', 'png', 'webp', 'heic', 'heif']);
 const DEFAULT_ARTIST = 'Unknown Artist';
-/** Shown on car displays and lock screens when a song has no album, instead of N/A. */
-const DEFAULT_ALBUM = 'Local Files';
 
 const SORT_LABELS: Record<SortKey, string> = {
   custom: 'Custom order',
@@ -404,7 +402,6 @@ function toPlayerTrack(track: LibraryTrack): AddTrack {
     url: track.uri,
     title: track.title,
     artist: track.artist,
-    album: track.album || DEFAULT_ALBUM,
     artwork: track.artwork ?? undefined,
   };
 }
@@ -783,6 +780,9 @@ async function playbackService(): Promise<void> {
   TrackPlayer.addEventListener(Event.PlaybackError, (event) => {
     console.warn(`Playback error ${event.code}: ${event.message}`);
   });
+  TrackPlayer.addEventListener(Event.PlaybackActiveTrackChanged, () => {
+    void broadcastNextUp();
+  });
 }
 
 TrackPlayer.registerPlaybackService(() => playbackService);
@@ -857,12 +857,45 @@ async function transportSeek(position: number): Promise<void> {
   }
 }
 
+/**
+ * Car and lock screen displays have an album slot, so it carries the next song in the queue.
+ * The album saved on each song stays untouched and is only used for organizing and search.
+ */
+let broadcastChain: Promise<void> = Promise.resolve();
+
+function broadcastNextUp(): Promise<void> {
+  broadcastChain = broadcastChain.then(async () => {
+    try {
+      const queue = await TrackPlayer.getQueue();
+      const index = await TrackPlayer.getActiveTrackIndex();
+      if (index === undefined || !queue[index]) {
+        return;
+      }
+      const repeat = await TrackPlayer.getRepeatMode();
+      let label: string;
+      if (repeat === RepeatMode.Track) {
+        label = 'Repeating this song';
+      } else {
+        const upcoming = queue[index + 1] ?? (repeat === RepeatMode.Queue && queue.length > 1 ? queue[0] : undefined);
+        label = upcoming?.title ? `Next: ${upcoming.title}` : 'End of queue';
+      }
+      if (queue[index].album !== label) {
+        await TrackPlayer.updateMetadataForTrack(index, { album: label });
+      }
+    } catch (error) {
+      console.warn('Could not update the next-up display', error);
+    }
+  });
+  return broadcastChain;
+}
+
 async function appendToQueue(added: LibraryTrack[]): Promise<void> {
   try {
     await setupTrackPlayer();
     const queue = await TrackPlayer.getQueue();
     if (queue.length > 0) {
       await TrackPlayer.add(added.map(toPlayerTrack));
+      void broadcastNextUp();
     }
   } catch (error) {
     console.warn('Could not extend the queue', error);
@@ -877,7 +910,6 @@ async function syncQueueMetadata(track: LibraryTrack): Promise<void> {
       await TrackPlayer.updateMetadataForTrack(index, {
         title: track.title,
         artist: track.artist,
-        album: track.album || DEFAULT_ALBUM,
         artwork: track.artwork ?? undefined,
       });
     }
@@ -892,6 +924,7 @@ async function removeFromQueue(id: string): Promise<void> {
     const index = queue.findIndex((item) => item.id === id);
     if (index >= 0) {
       await TrackPlayer.remove(index);
+      void broadcastNextUp();
     }
   } catch (error) {
     console.warn('Could not remove from the queue', error);
@@ -900,6 +933,12 @@ async function removeFromQueue(id: string): Promise<void> {
 
 /** Queues a song after the current one (playNext) or at the end. Returns a short message. */
 async function enqueueTrack(track: LibraryTrack, playNext: boolean): Promise<string> {
+  const message = await enqueueTrackRaw(track, playNext);
+  void broadcastNextUp();
+  return message;
+}
+
+async function enqueueTrackRaw(track: LibraryTrack, playNext: boolean): Promise<string> {
   await setupTrackPlayer();
   const queue = await TrackPlayer.getQueue();
   if (queue.length === 0) {
@@ -932,6 +971,11 @@ async function enqueueTrack(track: LibraryTrack, playNext: boolean): Promise<str
 }
 
 async function reorderUpcoming(library: LibraryTrack[], shuffle: boolean): Promise<void> {
+  await reorderUpcomingRaw(library, shuffle);
+  void broadcastNextUp();
+}
+
+async function reorderUpcomingRaw(library: LibraryTrack[], shuffle: boolean): Promise<void> {
   try {
     const activeIndex = await TrackPlayer.getActiveTrackIndex();
     if (activeIndex === undefined) {
@@ -2220,6 +2264,7 @@ function QueueSheet({ onClose }: { onClose: () => void }) {
       } catch (error) {
         console.warn('Queue change failed', error);
       }
+      void broadcastNextUp();
       await refresh();
     },
     [refresh],
@@ -2656,7 +2701,7 @@ function OptionsSheet({
               value={album}
               onChangeText={setAlbum}
               style={styles.input}
-              placeholder={DEFAULT_ALBUM}
+              placeholder="Album (for your own organizing)"
               placeholderTextColor={PALETTE.textSecondary}
               selectionColor={accent}
               autoCapitalize="words"
@@ -3748,6 +3793,7 @@ function AppShell() {
     try {
       const applied = await TrackPlayer.setRepeatMode(next);
       setRepeatMode(applied);
+      void broadcastNextUp();
     } catch (error) {
       console.warn('Could not change repeat mode', error);
     }
